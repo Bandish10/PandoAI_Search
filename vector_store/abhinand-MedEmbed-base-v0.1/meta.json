@@ -1,10 +1,3 @@
-{
-  "fingerprint": "74b105bfafa03bfde3acd3cb54ea06d6d3590dd3ab80aae647de68db7bcf035e",
-  "built_at": "2025-08-08T18:40:58.666922Z",
-  "model_repo": "abhinand/MedEmbed-base-v0.1",
-  "model_local_dir": "hf_models\\abhinand-MedEmbed-base-v0.1",
-  "excel_path": "Manipal_with_abbreviations.xlsx",
-  "rows": 3802,
-  "dim": 768,
-  "index_type": "FlatIP-cosine"
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:c135b6a63e0ffd3cfc8a13d765b2f69befde5281b80ea1547b1e0a755920727b
+size 365
