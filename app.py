@@ -33,9 +33,12 @@ ROWMETA_CSV = os.path.join(EMB_DIR, "rowmeta.csv")  # flags & combined text
 FAISS_PATH = os.path.join(IDX_DIR, "faiss.index")
 
 EMBED_BATCH_SIZE = 128
-RERANK_MULTIPLIER = 10          # search k*RERANK_MULTIPLIER then re-rank
-BOOST_MATCH = 0.12              # boost for matching intent
-PENALIZE_CONTRADICT = 0.12      # penalty for contradicting intent
+RERANK_MULTIPLIER = 10
+BOOST_MATCH = 0.12
+PENALIZE_CONTRADICT = 0.12
+
+# Read-only deploy mode (skip building embeddings on cloud)
+IS_READONLY_DEPLOY = os.environ.get("READONLY_DEPLOY", "1") == "1"
 
 st.set_page_config(page_title="Medical Vector Search", page_icon="🩺", layout="wide")
 st.markdown(
@@ -86,7 +89,7 @@ def concat_text(desc: str, syn: str, abbr: str) -> str:
     if pd.notna(abbr) and str(abbr).strip(): parts.append(str(abbr))
     return " [SEP] ".join(parts)
 
-# intent patterns (simple, fast)
+# intent patterns
 RE_UNILAT = re.compile(r"\b(unilateral|single|one|1\s*(?:side|sided)?)\b", re.I)
 RE_BILAT  = re.compile(r"\b(bilateral|both|two|2\s*(?:side|sided)?)\b", re.I)
 
@@ -96,13 +99,9 @@ def extract_flags(text: str) -> Tuple[bool, bool]:
 
 @st.cache_resource(show_spinner=False)
 def ensure_model(repo_id: str, local_dir: str) -> str:
-    os.makedirs(local_dir, exist_ok=True)
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=local_dir,
-        local_dir_use_symlinks=False,
-        resume_download=True,
-    )
+    if os.path.exists(local_dir) and any(os.scandir(local_dir)):
+        return local_dir  # already present
+    snapshot_download(repo_id=repo_id, local_dir=local_dir)
     return local_dir
 
 @st.cache_resource(show_spinner=False)
@@ -119,12 +118,7 @@ def load_df(excel_path: str) -> pd.DataFrame:
     return df
 
 def build_or_load_store(model: SentenceTransformer, df: pd.DataFrame):
-    """
-    Returns: (faiss_index, rowmap: Series, rowmeta: DataFrame, dim: int)
-    Embeddings are stored on disk; loaded with mmap for minimal RAM.
-    """
     ensure_dirs()
-    # include model files + excel in fingerprint
     model_files = list_all_files(MODEL_LOCAL_DIR)
     fp = file_fingerprint([EXCEL_PATH] + model_files)
 
@@ -145,9 +139,8 @@ def build_or_load_store(model: SentenceTransformer, df: pd.DataFrame):
 
     if cache_ok:
         index = faiss.read_index(FAISS_PATH)
-        embs = np.load(EMB_NPY, mmap_mode="r")  # mmap keeps memory low
-        dim = int(embs.shape[1])
-        del embs
+        embs = np.load(EMB_NPY, mmap_mode="r")
+        dim = int(embs.shape[1]); del embs
         rowmap = pd.read_csv(ROWMAP_CSV)["orig_idx"]
         rowmeta = pd.read_csv(ROWMETA_CSV)
         return index, rowmap, rowmeta, dim
@@ -170,7 +163,7 @@ def build_or_load_store(model: SentenceTransformer, df: pd.DataFrame):
             batch_size=EMBED_BATCH_SIZE,
             convert_to_numpy=True,
             show_progress_bar=True,
-            normalize_embeddings=True,  # cosine == dot
+            normalize_embeddings=True,
         )
         dim = int(embs.shape[1])
         index = faiss.IndexFlatIP(dim)
@@ -196,7 +189,17 @@ def build_or_load_store(model: SentenceTransformer, df: pd.DataFrame):
         del embs
         return index, pd.Series(np.arange(len(df))), rowmeta, dim
 
-def faiss_search(index: faiss.Index, query_vec: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
+def try_load_store_only():
+    if os.path.exists(FAISS_PATH) and os.path.exists(EMB_NPY) and os.path.exists(ROWMAP_CSV) and os.path.exists(ROWMETA_CSV):
+        idx = faiss.read_index(FAISS_PATH)
+        embs = np.load(EMB_NPY, mmap_mode="r")
+        d = int(embs.shape[1]); del embs
+        rm = pd.read_csv(ROWMAP_CSV)["orig_idx"]
+        rmeta = pd.read_csv(ROWMETA_CSV)
+        return idx, rm, rmeta, d
+    return None, None, None, 0
+
+def faiss_search(index: faiss.Index, query_vec: np.ndarray, top_k: int):
     if query_vec.ndim == 1:
         query_vec = query_vec[None, :]
     scores, idxs = index.search(query_vec.astype(np.float32), top_k)
@@ -205,7 +208,7 @@ def faiss_search(index: faiss.Index, query_vec: np.ndarray, top_k: int) -> Tuple
 def embed_query(model: SentenceTransformer, text: str) -> np.ndarray:
     return model.encode([text], convert_to_numpy=True, normalize_embeddings=True)[0]
 
-def rerank_with_intent(df: pd.DataFrame, rowmeta: pd.DataFrame, idxs: np.ndarray, scores: np.ndarray, query: str):
+def rerank_with_intent(rowmeta: pd.DataFrame, idxs: np.ndarray, scores: np.ndarray, query: str):
     q_uni = bool(RE_UNILAT.search(query))
     q_bi  = bool(RE_BILAT.search(query))
 
@@ -218,7 +221,7 @@ def rerank_with_intent(df: pd.DataFrame, rowmeta: pd.DataFrame, idxs: np.ndarray
         adj_scores += BOOST_MATCH * meta_sel["has_bilateral"].to_numpy()
         adj_scores -= PENALIZE_CONTRADICT * meta_sel["has_unilateral"].to_numpy()
 
-    order = np.argsort(-adj_scores, kind="stable")  # stable keeps initial order for ties
+    order = np.argsort(-adj_scores, kind="stable")
     return idxs[order], adj_scores[order]
 
 def build_results_df(df: pd.DataFrame, idxs: np.ndarray, scores: np.ndarray) -> pd.DataFrame:
@@ -232,26 +235,24 @@ def build_results_df(df: pd.DataFrame, idxs: np.ndarray, scores: np.ndarray) -> 
 # =========================
 st.title("🩺 Medical Vector Search (FAISS + MedEmbed)")
 
-# Model (cached)
-try:
-    local_dir = ensure_model(MODEL_REPO, MODEL_LOCAL_DIR)
-    model = load_model(local_dir)
-except Exception as e:
-    st.error(f"Failed to download/load model '{MODEL_REPO}': {e}")
-    st.info("If you see an auth error or rate-limit, run `huggingface-cli login` or set HF_TOKEN.")
-    st.stop()
+# Model & data
+local_dir = ensure_model(MODEL_REPO, MODEL_LOCAL_DIR)
+model = load_model(local_dir)
+df = load_df(EXCEL_PATH)
 
-# Data
-try:
-    df = load_df(EXCEL_PATH)
-except Exception as e:
-    st.error(f"Failed to load Excel: {e}")
-    st.stop()
+# Vector store loading
+index, rowmap, rowmeta, dim = try_load_store_only()
+if not index:
+    if IS_READONLY_DEPLOY:
+        st.warning("Embeddings/index not found in this deployment.\n\n"
+                   "Build locally once and push `vector_store/` via Git LFS, then redeploy.")
+        st.stop()
+    else:
+        index, rowmap, rowmeta, dim = build_or_load_store(model, df)
+else:
+    st.caption("✅ Loaded prebuilt embeddings & index from `vector_store/`")
 
-# Vector store
-index, rowmap, rowmeta, dim = build_or_load_store(model, df)
-
-# --- Session state init (DO NOT bind to same keys as widgets) ---
+# --- Session state init ---
 if "query" not in st.session_state:
     st.session_state["query"] = ""
 if "committed_query" not in st.session_state:
@@ -261,13 +262,13 @@ if "results" not in st.session_state:
 if "top_k" not in st.session_state:
     st.session_state["top_k"] = 20
 
-# Controls (use different widget keys to avoid the mutation error)
+# Controls
 with st.form("search_form", clear_on_submit=False):
     query_input = st.text_input(
         "Search",
         value=st.session_state["query"],
         key="query_input",
-        placeholder="Type your query (e.g., 'TKR single', 'TKR unilateral') and press Enter…"
+        placeholder="Type your query and press Enter…"
     )
     topk_value = st.slider(
         "Number of results",
@@ -277,7 +278,7 @@ with st.form("search_form", clear_on_submit=False):
     )
     submitted = st.form_submit_button("Search")
 
-# Only when user submits do we compute/search and lock the query
+# On submit
 if submitted:
     st.session_state["query"] = query_input
     st.session_state["top_k"] = int(topk_value)
@@ -287,23 +288,17 @@ if submitted:
         st.warning("Please enter a query.")
         st.session_state["results"] = pd.DataFrame()
     else:
-        try:
-            qvec = embed_query(model, st.session_state["committed_query"])
-            # fetch extra for re-ranking
-            k_big = min(st.session_state["top_k"] * RERANK_MULTIPLIER, index.ntotal)
-            base_scores, base_idxs = faiss_search(index, qvec, top_k=k_big)
-            # keyword-aware rerank
-            rerank_idxs, rerank_scores = rerank_with_intent(
-                df, rowmeta, base_idxs, base_scores, st.session_state["committed_query"]
-            )
-            # trim to top_k
-            rerank_idxs = rerank_idxs[:st.session_state["top_k"]]
-            rerank_scores = rerank_scores[:st.session_state["top_k"]]
-            st.session_state["results"] = build_results_df(df, rerank_idxs, rerank_scores)
-        except Exception as e:
-            st.error(f"Search failed: {e}")
+        qvec = embed_query(model, st.session_state["committed_query"])
+        k_big = min(st.session_state["top_k"] * RERANK_MULTIPLIER, index.ntotal)
+        base_scores, base_idxs = faiss_search(index, qvec, top_k=k_big)
+        rerank_idxs, rerank_scores = rerank_with_intent(
+            rowmeta, base_idxs, base_scores, st.session_state["committed_query"]
+        )
+        rerank_idxs = rerank_idxs[:st.session_state["top_k"]]
+        rerank_scores = rerank_scores[:st.session_state["top_k"]]
+        st.session_state["results"] = build_results_df(df, rerank_idxs, rerank_scores)
 
-# Metrics (no need to keep embeddings in RAM)
+# Metrics
 m1, m2, m3 = st.columns([2,2,2])
 m1.metric("Rows indexed", len(df))
 m2.metric("Dim", int(dim))

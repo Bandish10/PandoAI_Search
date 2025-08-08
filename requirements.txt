@@ -1,7 +1,3 @@
-streamlit
-sentence-transformers
-faiss-cpu
-pandas
-numpy
-openpyxl
-huggingface_hub
+version https://git-lfs.github.com/spec/v1
+oid sha256:4539836200c2ef05adddfacd0fd2225c3164ecc573a948ba5ea55b8cca34674c
+size 262
