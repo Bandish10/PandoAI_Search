@@ -16,5 +16,4 @@ Thumbs.db
 venv/
 env/
 
-# Large local caches
-vector_store/
+
